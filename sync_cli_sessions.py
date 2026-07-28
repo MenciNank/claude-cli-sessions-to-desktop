@@ -7,7 +7,12 @@ r"""
   - Desktop 的会话列表靠  %LOCALAPPDATA%\Claude-3p\claude-code-sessions\<账号>\<组织>\local_<会话id>.json
     这些是“索引卡片”，只记录标题/路径/指向哪个 jsonl，不存对话本身。
   - 本脚本为每个尚未登记的 CLI 会话，生成一张索引卡片，让它出现在 Desktop 列表里。
-    恢复时 Desktop 执行的就是 `claude --resume <会话id>`，读的还是那份 jsonl。
+    恢复时 Desktop 执行的就是 claude --resume <会话id>，读的还是那份 jsonl。
+
+标题来源（依次回退，保证任何会话都有可读标题）：
+  自定义标题(custom-title) > AI 标题(ai-title) > 第一条用户消息 > 最后一条用户消息 > “(无标题会话)”
+  其中 custom-title / ai-title 是 Claude Code CLI 原生写入 jsonl 的，任何人用 CLI 都会有；
+  万一某会话没有这些标题（比如刚开一两句就退出），自动用消息内容兜底。
 
 特点：
   - 全自动探测账号/组织目录，不写死任何机器专属 ID（换台电脑也能用）。
@@ -25,7 +30,6 @@ DRY = "--dry-run" in sys.argv
 
 
 def log(msg):
-    # 控制台在中文 Windows 上可能是 GBK，遇到无法编码的字符不崩溃
     try:
         print(msg)
     except Exception:
@@ -33,7 +37,6 @@ def log(msg):
 
 
 def find_projects_dir():
-    """CLI 会话原文所在目录。"""
     p = os.path.join(os.path.expanduser("~"), ".claude", "projects")
     return p if os.path.isdir(p) else None
 
@@ -65,7 +68,6 @@ def find_store_dir():
     if not candidates:
         return None, ("Desktop 存储目录存在但里面没有任何会话：\n  " + root +
                       "\n请先在 Claude Desktop 里新建并保存一个会话，再运行本脚本。")
-    # 先按已有会话数、再按最近修改时间挑
     candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
     return candidates[0][2], None
 
@@ -77,13 +79,36 @@ def to_ms(iso):
         return 0
 
 
-def extract(jsonl_path):
-    """从一个 .jsonl 里读出 cwd / 标题 / 时间 / 条数。"""
+def _user_text(o):
+    """从一条 user 记录里取纯文本；非人话（斜杠命令/系统提示）返回空串。"""
+    msg = o.get("message", {}) or {}
+    c = msg.get("content")
+    txt = ""
+    if isinstance(c, str):
+        txt = c
+    elif isinstance(c, list):
+        for part in c:
+            if isinstance(part, dict) and part.get("type") == "text":
+                txt += part.get("text", "")
+    txt = "".join(ch for ch in txt if ch.isprintable()).strip()
+    if txt and not txt.startswith("<") and "command-name" not in txt:
+        return txt
+    return ""
+
+
+def extract(jsonl_path, sid):
+    """
+    从一个 .jsonl 里读出 cwd / 标题 / 条数 / 起止时间。
+    标题按优先级回退，返回 (cwd, title, title_source, n, first_ts, last_ts)。
+    """
     cwd = ""
-    title = ""
     n = 0
     first_ts = None
     last_ts = None
+    custom_title = None   # 用户手动改的名（最高优先，取最新一次）
+    ai_title = None       # CLI 自动生成的标题（取最新一次）
+    first_user = ""       # 第一条人话
+    last_user = ""        # 最后一条人话（兜底）
     with open(jsonl_path, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
             line = line.strip()
@@ -93,32 +118,43 @@ def extract(jsonl_path):
                 o = json.loads(line)
             except Exception:
                 continue
+            if not isinstance(o, dict):
+                continue
             n += 1
-            if not cwd and isinstance(o, dict) and o.get("cwd"):
+            if not cwd and o.get("cwd"):
                 cwd = o["cwd"]
-            ts = o.get("timestamp") if isinstance(o, dict) else None
+            ts = o.get("timestamp")
             if ts:
                 if not first_ts:
                     first_ts = ts
                 last_ts = ts
-            if not title and isinstance(o, dict) and o.get("type") == "user":
-                msg = o.get("message", {}) or {}
-                c = msg.get("content")
-                txt = ""
-                if isinstance(c, str):
-                    txt = c
-                elif isinstance(c, list):
-                    for part in c:
-                        if isinstance(part, dict) and part.get("type") == "text":
-                            txt += part.get("text", "")
-                txt = "".join(ch for ch in txt if ch.isprintable()).strip()
-                # 跳过斜杠命令、系统提示等，取第一条真实人话
-                if txt and not txt.startswith("<") and "command-name" not in txt:
-                    title = txt[:50]
-    return cwd, (title or "(无标题会话)"), n, first_ts, last_ts
+            typ = o.get("type")
+            # 标题条目只认属于本会话(sessionId==文件名)的，避免串到别的会话
+            if typ == "custom-title" and o.get("sessionId") == sid and o.get("customTitle"):
+                custom_title = o["customTitle"]
+            elif typ == "ai-title" and o.get("sessionId") == sid and o.get("aiTitle"):
+                ai_title = o["aiTitle"]
+            elif typ == "user":
+                txt = _user_text(o)
+                if txt:
+                    if not first_user:
+                        first_user = txt[:50]
+                    last_user = txt[:50]
+
+    if custom_title:
+        title, src = custom_title, "custom"
+    elif ai_title:
+        title, src = ai_title, "ai"
+    elif first_user:
+        title, src = first_user, "first-message"
+    elif last_user:
+        title, src = last_user, "last-message"
+    else:
+        title, src = "(无标题会话)", "none"
+    return cwd, title, src, n, first_ts, last_ts
 
 
-def build_record(cli_id, cwd, title, first_ts, last_ts):
+def build_record(cli_id, cwd, title, title_source, first_ts, last_ts):
     c_ms = to_ms(first_ts) if first_ts else 0
     l_ms = to_ms(last_ts) if last_ts else c_ms
     return {
@@ -134,6 +170,7 @@ def build_record(cli_id, cwd, title, first_ts, last_ts):
         "sessionSettings": {"ultracode": False},
         "isArchived": False,
         "title": title,
+        "titleSource": title_source,
         "permissionMode": "default",
         "enabledMcpTools": {},
         "remoteMcpServersConfig": [],
@@ -170,26 +207,25 @@ def main():
         if fname in existing:
             skipped_exist += 1
             continue
-        cwd, title, n, first_ts, last_ts = extract(jf)
+        cwd, title, src, n, first_ts, last_ts = extract(jf, cli_id)
         if n < MIN_LINES:
             skipped_short += 1
             continue
-        rec = build_record(cli_id, cwd, title, first_ts, last_ts)
+        rec = build_record(cli_id, cwd, title, src, first_ts, last_ts)
         if not DRY:
             with open(os.path.join(store, fname), "w", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False))
-        created.append((cwd, title))
+        created.append((cwd, title, src))
 
-    # 报告：写一份 UTF-8 文件，避免控制台乱码
     report_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "上次同步结果.txt")
     lines = []
     lines.append("=== 会话同步结果 ===")
     lines.append(("[预览] " if DRY else "") + "新增: %d   已存在(跳过): %d   太短(跳过): %d"
                  % (len(created), skipped_exist, skipped_short))
     lines.append("")
-    lines.append("--- 本次" + ("将" if DRY else "已") + "新增的会话 ---")
-    for cwd, t in created:
-        lines.append("[%s] %s" % (cwd, t))
+    lines.append("--- 本次" + ("将" if DRY else "已") + "新增的会话（标题来源）---")
+    for cwd, t, src in created:
+        lines.append("[%s] %s  (%s)" % (cwd, t, src))
     with open(report_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
